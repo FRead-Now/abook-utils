@@ -1,0 +1,127 @@
+# Installs abook-utils on a clean Apple Silicon Mac, the way an audio editor
+# does, every time a release is published: `brew test`, `abook --version`, a
+# first `abook search` (which builds its LibriVox title index from nothing) and
+# a first transcription (which downloads its speech model); then, where an
+# earlier release exists, installs that one and upgrades it to this one.
+#
+# Synced from fread/fread-tools' packaging/abook-utils/github/ by its abook
+# release job: edit it there. Run it by hand from the Actions tab
+# (workflow_dispatch) to re-check the latest release.
+name: verify install
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TAP: fread-now/tap
+  TAP_REPO: FRead-Now/homebrew-tap
+
+jobs:
+  version:
+    name: which release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      # Read through env, never interpolated into the script: a release name is
+      # input, and ${{ }} inside run: is a shell-injection sink.
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          PRE: ${{ github.event.release.prerelease }}
+        run: |
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+            PRE=false
+          fi
+          echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+' || { echo "::error::'$TAG' is not a release tag"; exit 1; }
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "abook-utils $TAG" >> "$GITHUB_STEP_SUMMARY"
+
+  # The release is published before its tap commit lands (the release job
+  # pushes it right after), so wait for the tap to name it.
+  packaged:
+    name: tap carries it
+    needs: version
+    if: needs.version.outputs.prerelease != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          for i in $(seq 1 60); do
+            f=$(gh api "repos/$TAP_REPO/contents/Formula/abook-utils.rb" --jq .content 2>/dev/null | base64 -d || true)
+            if echo "$f" | grep -q "abook-utils-$VERSION.tar.gz"; then
+              echo "tap carries $VERSION"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::after 10 minutes the tap still does not carry $VERSION"; exit 1
+
+  brew:
+    name: brew (${{ matrix.os }})
+    needs: [version, packaged]
+    strategy:
+      fail-fast: false
+      matrix:
+        # Apple Silicon only (CW-19): macos-latest is arm64.
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: Install, as an audio editor does
+        run: |
+          brew install "$TAP/abook-utils"
+          brew test abook-utils
+      - name: abook --version
+        run: |
+          got=$(abook --version); echo "$got"
+          case "$got" in "abook v$VERSION ("*")") ;; *) echo "::error::abook answered '$got'"; exit 1 ;; esac
+          echo "brew on ${{ matrix.os }}: $got" >> "$GITHUB_STEP_SUMMARY"
+      # The first search builds the LibriVox title index, about 45 pages a
+      # second apart: a minute when the API is quick, ten or more when not.
+      - name: abook search, from an empty index
+        timeout-minutes: 30
+        run: |
+          abook search "Huckleberry Finn" | tee search.txt
+          grep -Eq '^ +59  Adventures of Huckleberry Finn ' search.txt ||
+            { echo "::error::search did not list LibriVox 59"; exit 1; }
+      # The first transcription downloads Whisper base.en (about 150 MB) into
+      # ~/.cache. align's two larger models download the same way; a runner
+      # has no Metal device for mlx, so align itself is checked on a Mac.
+      - name: A first transcription fetches its model
+        run: |
+          say -o speech.aiff "Chapter one. It was the best of times, it was the worst of times."
+          ffmpeg -v error -i speech.aiff speech.mp3
+          abook transcribe speech.mp3 | tee transcript.txt
+          grep -qi "best of times" transcript.txt || { echo "::error::the transcript misses the sentence"; exit 1; }
+          ls -d ~/.cache/huggingface/hub/models--Systran--faster-whisper-base.en
+      # An audio editor's upgrade: the previous formula, from the tap's own
+      # history, then `brew upgrade`. Skipped for the first release.
+      - name: Upgrade from the previous release
+        run: |
+          brew uninstall abook-utils
+          tap=$(brew --repo "$TAP")
+          prev=$(git -C "$tap" log --format=%H --skip=1 -n 1 -- Formula/abook-utils.rb)
+          if [ -z "$prev" ]; then echo "no earlier release in the tap: nothing to upgrade from"; exit 0; fi
+          git -C "$tap" checkout -q "$prev"
+          brew install "$TAP/abook-utils"
+          old=$(abook --version)
+          git -C "$tap" checkout -q -
+          brew upgrade abook-utils
+          new=$(abook --version)
+          echo "$old -> $new"
+          case "$new" in "abook v$VERSION "*) ;; *) echo "::error::upgrade left '$new'"; exit 1 ;; esac
+          echo "brew upgrade on ${{ matrix.os }}: $old -> $new" >> "$GITHUB_STEP_SUMMARY"
